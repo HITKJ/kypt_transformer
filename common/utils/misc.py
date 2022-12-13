@@ -248,6 +248,14 @@ def get_tgt_mask():
             e = e + cfg.num_joint_queries_per_hand
             tgt_mask[s:e, :] = True
             tgt_mask[s:e, s:e] = False
+        ## 加入相同层次的
+        for i in range(4):
+            q = np.arange(i,20,4)
+            for j in range(5):
+                # right hand 
+                tgt_mask[q[j],q] = False
+                # left hand 
+                tgt_mask[q[j]+cfg.num_joint_queries_per_hand, q+cfg.num_joint_queries_per_hand] = False 
         # trans and shape
         tgt_mask[cfg.shape_indx, :] = True
         tgt_mask[cfg.shape_indx, cfg.shape_indx] = False
