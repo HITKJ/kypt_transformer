@@ -1,0 +1,9 @@
+.idea
+__pycache__/*
+*/__pycache__
+*.tsv
+*.pyc
+*.pkl
+*.pickle
+output/*
+*.tar
