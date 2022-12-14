@@ -22,7 +22,7 @@ def fix_seeds(random_seed):
 
 class Config:
     user_home = os.environ['HOME']
-    debug = 0
+    debug = 1
     # ~~~~~~~~~~~~~~~~~~~~~~Dataset~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
     dataset = 'InterHand2.6M'  # InterHand2.6M, ho3d, h2o3d, ho3d_h2o3d
     pose_representation = '2p5D' #3D, 2p5D, angles
@@ -144,7 +144,8 @@ class Config:
     nheads = 8
     dim_feedforward = 2048
     enc_layers = 6
-    dec_layers = 9
+    dec_layers = 6 
+    dec_type = "Dual"  #"Dual" or "Normal"
     dec_layers_1 = 0
     pre_norm = False
 

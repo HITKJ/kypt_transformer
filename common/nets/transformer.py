@@ -30,15 +30,21 @@ class Transformer(nn.Module):
         encoder_inter_norm = nn.LayerNorm(d_model)
         self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm, encoder_inter_norm, return_intermediate_dec)
 
-        decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
+        decoder_layer_norm = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
+                                                dropout, activation, normalize_before)
+        decoder_layer_dual = TransformerDualDecoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before)
         decoder_norm = nn.LayerNorm(d_model)
-        self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
+
+        if cfg.dec_type == "Dual":
+            self.decoder = TransformerDecoder(decoder_layer_dual, num_decoder_layers, decoder_norm,
                                           return_intermediate=return_intermediate_dec)
-        
+        elif cfg.dec_type == "Normal":
+            self.decoder = TransformerDecoder(decoder_layer_norm, num_decoder_layers, decoder_norm,
+                                          return_intermediate=return_intermediate_dec)
         ### 额外再加一层,针对现有的相对比较重要的结点query再做一次查询
         if cfg.dec_layers_1 >0:
-            self.decoder_1 = TransformerDecoder(decoder_layer, cfg.dec_layers_1, decoder_norm,
+            self.decoder_1 = TransformerDecoder(decoder_layer_norm, cfg.dec_layers_1, decoder_norm,
                                             return_intermediate=return_intermediate_dec)
         
         if cfg.hand_type=='both' and False:
@@ -315,6 +321,161 @@ class TransformerDecoderLayer(nn.Module):
                                     tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
         return self.forward_post(tgt, memory, tgt_mask, memory_mask,
                                  tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
+
+## 针对双流分支进一步加入双手的交互
+class TransformerDualDecoderLayer(nn.Module):
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
+                 activation="relu", normalize_before=False):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.activation = _get_activation_fn(activation)
+        self.normalize_before = normalize_before
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
+
+
+    def forward_post(self, tgt, memory,
+                     tgt_mask: Optional[Tensor] = None,
+                     memory_mask: Optional[Tensor] = None,
+                     tgt_key_padding_mask: Optional[Tensor] = None,
+                     memory_key_padding_mask: Optional[Tensor] = None,
+                     pos: Optional[Tensor] = None,
+                     query_pos: Optional[Tensor] = None):
+        q = k = self.with_pos_embed(tgt, query_pos)  #43xbx256 
+        tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
+                              key_padding_mask=tgt_key_padding_mask)[0]
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+        tgt2, attn_wts = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
+                                   key=self.with_pos_embed(memory, pos),
+                                   value=memory, attn_mask=memory_mask,
+                                   key_padding_mask=memory_key_padding_mask)
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+
+        num = cfg.num_joint_queries_per_hand
+        ltgt = tgt[:num,:,:]
+        rtgt = tgt[num:2*num,:,:]
+        l_pos = query_pos[:num,:,:]
+        r_pos = query_pos[num:2*num:,:,:]
+
+        ## 做自注意力查询
+        # 左手 
+        q = k = self.with_pos_embed(ltgt,l_pos)
+        ltgt2 = self.self_attn(q,k,value=ltgt)[0]
+        ltgt = ltgt + self.dropout1(ltgt2)
+        ltgt = self.norm1(ltgt)
+        # 右手
+        q = k = self.with_pos_embed(rtgt,r_pos)
+        rtgt2 = self.self_attn(q,k,value=rtgt)[0]
+        rtgt = rtgt + self.dropout1(rtgt2)
+        rtgt = self.norm1(rtgt)
+
+        ## 双手交互做查询 
+        # 左手向右手做查询
+        ltgt2, attn_wts_l = self.multihead_attn(query=self.with_pos_embed(ltgt, l_pos),
+                                   key=self.with_pos_embed(rtgt, r_pos),
+                                   value=rtgt)
+        #右手向左手做查询
+        rtgt2, attn_wts_r = self.multihead_attn(query=self.with_pos_embed(rtgt,r_pos),
+                                   key=self.with_pos_embed(ltgt,l_pos),
+                                   value=ltgt)
+
+        ltgt=ltgt+self.dropout1(ltgt2)
+        rtgt=rtgt+self.dropout1(rtgt2)
+        tgt = torch.cat([ltgt,rtgt,tgt[2*num:]])
+        tgt = self.norm1(tgt)
+
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm3(tgt)
+        return tgt, attn_wts
+
+    def forward_pre(self, tgt, memory,
+                    tgt_mask: Optional[Tensor] = None,
+                    memory_mask: Optional[Tensor] = None,
+                    tgt_key_padding_mask: Optional[Tensor] = None,
+                    memory_key_padding_mask: Optional[Tensor] = None,
+                    pos: Optional[Tensor] = None,
+                    query_pos: Optional[Tensor] = None):
+        tgt2 = self.norm1(tgt)
+        q = k = self.with_pos_embed(tgt, query_pos)  #43xbx256 
+        tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
+                              key_padding_mask=tgt_key_padding_mask)[0]
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+        tgt2, attn_wts = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
+                                   key=self.with_pos_embed(memory, pos),
+                                   value=memory, attn_mask=memory_mask,
+                                   key_padding_mask=memory_key_padding_mask)
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+
+        num = cfg.num_joint_queries_per_hand
+        ltgt = tgt[:num,:,:]
+        rtgt = tgt[num:2*num,:,:]
+        l_pos = query_pos[:num,:,:]
+        r_pos = query_pos[num:2*num:,:,:]
+
+        ## 做自注意力查询
+        # 左手 
+        q = k = self.with_pos_embed(ltgt,l_pos)
+        ltgt2 = self.self_attn(q,k,value=ltgt)[0]
+        ltgt = ltgt + self.dropout1(ltgt2)
+        ltgt = self.norm1(ltgt)
+        # 右手
+        q = k = self.with_pos_embed(rtgt,r_pos)
+        rtgt2 = self.self_attn(q,k,value=rtgt)[0]
+        rtgt = rtgt + self.dropout1(rtgt2)
+        rtgt = self.norm1(rtgt)
+
+        ## 双手交互做查询 
+        # 左手向右手做查询
+        ltgt2, attn_wts_l = self.multihead_attn(query=self.with_pos_embed(ltgt, l_pos),
+                                   key=self.with_pos_embed(rtgt, r_pos),
+                                   value=rtgt)
+        #右手向左手做查询
+        rtgt2, attn_wts_r = self.multihead_attn(query=self.with_pos_embed(rtgt,r_pos),
+                                   key=self.with_pos_embed(ltgt,l_pos),
+                                   value=ltgt)
+
+        ltgt=ltgt+self.dropout1(ltgt2)
+        rtgt=rtgt+self.dropout1(rtgt2)
+        tgt = torch.cat([ltgt,rtgt,tgt[2*num:]])
+        tgt = self.norm1(tgt)
+
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        return tgt,attn_wts
+    
+    def forward(self, tgt, memory,
+                tgt_mask: Optional[Tensor] = None,
+                memory_mask: Optional[Tensor] = None,
+                tgt_key_padding_mask: Optional[Tensor] = None,
+                memory_key_padding_mask: Optional[Tensor] = None,
+                pos: Optional[Tensor] = None,
+                query_pos: Optional[Tensor] = None):
+        if self.normalize_before:
+            return self.forward_pre(tgt, memory, tgt_mask, memory_mask,
+                                    tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
+        return self.forward_post(tgt, memory, tgt_mask, memory_mask,
+                                 tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
+
 
 
 def _get_clones(module, N):
